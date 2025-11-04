@@ -276,33 +276,33 @@ def render_stock_management():
         
         if not stock_data:
             st.warning("No stock items found.")
-            return
+            # We don't return here, so tab2 and tab3 can still render
+        else:
+            for item in stock_data:
+                color = ""
+                if (item['tracking_type'] in ['UNIT', 'MULTI-USE'] and item['current_quantity'] < 10) or \
+                   (item['tracking_type'] == 'MANUAL' and item['current_quantity'] == 0):
+                    color = "red"
 
-        for item in stock_data:
-            color = ""
-            if (item['tracking_type'] in ['UNIT', 'MULTI-USE'] and item['current_quantity'] < 10) or \
-               (item['tracking_type'] == 'MANUAL' and item['current_quantity'] == 0):
-                color = "red"
-
-            label = f":{color}[{item['name']}] (Current: {item['current_quantity']} {item['unit_of_measure']})"
-            
-            with st.expander(label):
-                st.write(f"**Tracking Type:** {item['tracking_type']}")
-                st.write(f"**Cost Per Unit:** ${item['cost_per_unit']:.4f}")
-                st.write(f"**Item ID:** `{item['id']}`")
+                label = f":{color}[{item['name']}] (Current: {item['current_quantity']} {item['unit_of_measure']})"
                 
-                if st.button("Delete This Item", key=f"del_stock_{item['id']}", type="primary"):
-                    try:
-                        # Check if item is in a recipe
-                        recipe_links = db.table('menu_item_recipe').select('id').eq('stock_item_id', item['id']).execute().data
-                        if recipe_links:
-                            st.error(f"Cannot delete '{item['name']}'. It is used in {len(recipe_links)} recipe(s). Please remove it from all recipes first.")
-                        else:
-                            db.table('stock_items').delete().eq('id', item['id']).execute()
-                            st.success(f"Deleted {item['name']}.")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Error deleting item: {e}")
+                with st.expander(label):
+                    st.write(f"**Tracking Type:** {item['tracking_type']}")
+                    st.write(f"**Cost Per Unit:** ${item['cost_per_unit']:.4f}")
+                    st.write(f"**Item ID:** `{item['id']}`")
+                    
+                    if st.button("Delete This Item", key=f"del_stock_{item['id']}", type="primary"):
+                        try:
+                            # Check if item is in a recipe
+                            recipe_links = db.table('menu_item_recipe').select('id').eq('stock_item_id', item['id']).execute().data
+                            if recipe_links:
+                                st.error(f"Cannot delete '{item['name']}'. It is used in {len(recipe_links)} recipe(s). Please remove it from all recipes first.")
+                            else:
+                                db.table('stock_items').delete().eq('id', item['id']).execute()
+                                st.success(f"Deleted {item['name']}.")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error deleting item: {e}")
 
     with tab2:
         st.header("Add New Stock Item")
@@ -323,8 +323,11 @@ def render_stock_management():
             
             submitted = st.form_submit_button("Add Item")
             if submitted:
-                if not name or not tracking_type or not cost_per_unit:
-                    st.warning("Please fill out all fields.")
+                # === FIX ===
+                # Changed validation to only check for 'name', as other fields
+                # have valid defaults (like 0 for cost).
+                if not name:
+                    st.warning("Please fill out the 'Item Name'.")
                 else:
                     try:
                         db.table('stock_items').insert({
@@ -341,6 +344,11 @@ def render_stock_management():
 
     with tab3:
         st.header("Restock Item")
+        
+        if not stock_data:
+            st.warning("No stock items to restock.")
+            return
+
         st.info("Add to existing stock quantity or mark a 'MANUAL' item as restocked.")
         
         item_to_restock = st.selectbox(
@@ -404,19 +412,19 @@ def render_menu_management():
             menu_data = db.table('menu_items').select('*').order('name').execute().data
             if not menu_data:
                 st.warning("No menu items added yet.")
-            
-            for item in menu_data:
-                with st.expander(f"{item['name']} - ${item['sale_price']}"):
-                    if st.button("Delete This Menu Item", key=f"del_menu_{item['id']}", type="primary"):
-                        try:
-                            # Must delete recipe links first
-                            db.table('menu_item_recipe').delete().eq('menu_item_id', item['id']).execute()
-                            # Then delete the item itself
-                            db.table('menu_items').delete().eq('id', item['id']).execute()
-                            st.success(f"Deleted {item['name']}.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error deleting: {e}")
+            else:
+                for item in menu_data:
+                    with st.expander(f"{item['name']} - ${item['sale_price']}"):
+                        if st.button("Delete This Menu Item", key=f"del_menu_{item['id']}", type="primary"):
+                            try:
+                                # Must delete recipe links first
+                                db.table('menu_item_recipe').delete().eq('menu_item_id', item['id']).execute()
+                                # Then delete the item itself
+                                db.table('menu_items').delete().eq('id', item['id']).execute()
+                                st.success(f"Deleted {item['name']}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting: {e}")
                             
         except Exception as e:
             st.error(f"Failed to load menu: {e}")
@@ -517,21 +525,21 @@ def render_staff_and_expenses():
             staff_data = db.table('workers').select('id, name, role, salary').execute().data
             if not staff_data:
                 st.warning("No staff added yet.")
-                
-            for worker in staff_data:
-                with st.expander(f"{worker['name']} ({worker['role']}) - ${worker['salary']}/month"):
-                    if st.button("Delete Worker", key=f"del_worker_{worker['id']}", type="primary"):
-                        try:
-                            # Check if worker has orders
-                            orders = db.table('orders').select('id').eq('server_id', worker['id']).execute().data
-                            if orders:
-                                st.error(f"Cannot delete {worker['name']}. They are linked to {len(orders)} order(s).")
-                            else:
-                                db.table('workers').delete().eq('id', worker['id']).execute()
-                                st.success(f"Deleted {worker['name']}.")
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"Error deleting: {e}")
+            else:    
+                for worker in staff_data:
+                    with st.expander(f"{worker['name']} ({worker['role']}) - ${worker['salary']}/month"):
+                        if st.button("Delete Worker", key=f"del_worker_{worker['id']}", type="primary"):
+                            try:
+                                # Check if worker has orders
+                                orders = db.table('orders').select('id').eq('server_id', worker['id']).execute().data
+                                if orders:
+                                    st.error(f"Cannot delete {worker['name']}. They are linked to {len(orders)} order(s).")
+                                else:
+                                    db.table('workers').delete().eq('id', worker['id']).execute()
+                                    st.success(f"Deleted {worker['name']}.")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting: {e}")
         except Exception as e:
             st.error(f"Failed to load staff: {e}")
 
@@ -560,16 +568,16 @@ def render_staff_and_expenses():
             expense_data = db.table('monthly_expenses').select('id, month, description, amount').order('month', desc=True).execute().data
             if not expense_data:
                 st.warning("No expenses logged yet.")
-            
-            for expense in expense_data:
-                with st.expander(f"{expense['month']} - {expense['description']} - ${expense['amount']}"):
-                    if st.button("Delete Expense", key=f"del_exp_{expense['id']}", type="primary"):
-                        try:
-                            db.table('monthly_expenses').delete().eq('id', expense['id']).execute()
-                            st.success(f"Deleted {expense['description']}.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error deleting: {e}")
+            else:
+                for expense in expense_data:
+                    with st.expander(f"{expense['month']} - {expense['description']} - ${expense['amount']}"):
+                        if st.button("Delete Expense", key=f"del_exp_{expense['id']}", type="primary"):
+                            try:
+                                db.table('monthly_expenses').delete().eq('id', expense['id']).execute()
+                                st.success(f"Deleted {expense['description']}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting: {e}")
         except Exception as e:
             st.error(f"Failed to load expenses: {e}")
 
