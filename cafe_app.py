@@ -3,10 +3,11 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime, date, time
 from collections import defaultdict
+import calendar # Required for daily salary calculation
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Cafe Manager",
+    page_title="مدير المقهى",
     page_icon="☕",
     layout="wide"
 )
@@ -20,8 +21,8 @@ def init_supabase_client():
         key = st.secrets["SUPABASE_KEY"]
         return create_client(url, key)
     except Exception as e:
-        st.error(f"Error connecting to Supabase: {e}")
-        st.info("Please check your .streamlit/secrets.toml file.")
+        st.error(f"خطأ في الاتصال بـ Supabase: {e}")
+        st.info("يرجى التحقق من ملف .streamlit/secrets.toml الخاص بك.")
         return None
 
 db = init_supabase_client()
@@ -46,17 +47,77 @@ def get_month_range(selected_date):
     
     start_iso = datetime.combine(start_of_month, time.min).isoformat()
     end_iso = datetime.combine(end_of_month, time.max).isoformat()
-    # === FIX ===
-    # start_of_month is already a 'date' object, so .date() call was incorrect.
     return start_iso, end_iso, start_of_month
 
 @st.cache_data(ttl=60)
-def calculate_menu_item_cost(menu_item_id):
-    """Calculates the cost of goods for a single menu item from its recipe."""
+def get_daily_salary_cost(selected_date: date):
+    """Fetches the total salary cost for a *specific* day using salary_history."""
+    total_salaries_today = 0
     try:
-        # Fetch the recipe and the cost of each stock item
+        workers = db.table('workers').select('id').execute().data
+        for worker in workers:
+            # Get the most recent salary that started *on or before* the selected date
+            salary_entry = db.table('salary_history').select('daily_salary').eq('worker_id', worker['id']).lte('start_date', selected_date.isoformat()).order('start_date', desc=True).limit(1).execute().data
+            if salary_entry:
+                total_salaries_today += salary_entry[0]['daily_salary']
+        return total_salaries_today
+    except Exception as e:
+        st.error(f"خطأ في حساب رواتب اليوم: {e}")
+        return 0
+
+@st.cache_data(ttl=60)
+def get_monthly_salary_cost(selected_month_date: date):
+    """
+    Calculates the total salary cost for an entire month,
+    respecting salary changes within that month.
+    """
+    total_monthly_salary = 0
+    try:
+        workers = db.table('workers').select('id').execute().data
+        days_in_month = calendar.monthrange(selected_month_date.year, selected_month_date.month)[1]
+        
+        # Cache for each worker's salary to avoid DB calls in loop
+        worker_salary_cache = {}
+
+        for day in range(1, days_in_month + 1):
+            current_date_for_loop = selected_month_date.replace(day=day)
+            total_salary_for_this_day = 0
+            
+            for worker in workers:
+                worker_id = worker['id']
+                
+                # Check cache first
+                if worker_id not in worker_salary_cache or worker_salary_cache[worker_id]['start_date'] > current_date_for_loop:
+                    # Cache is invalid or empty, fetch from DB
+                    salary_entry = db.table('salary_history').select('daily_salary, start_date').eq('worker_id', worker_id).lte('start_date', current_date_for_loop.isoformat()).order('start_date', desc=True).limit(1).execute().data
+                    if salary_entry:
+                        worker_salary_cache[worker_id] = {
+                            'salary': salary_entry[0]['daily_salary'],
+                            'start_date': datetime.fromisoformat(salary_entry[0]['start_date']).date()
+                        }
+                    else:
+                         worker_salary_cache[worker_id] = {'salary': 0, 'start_date': date(1900,1,1)} # No salary found
+                
+                # Use cached salary
+                total_salary_for_this_day += worker_salary_cache[worker_id]['salary']
+                
+            total_monthly_salary += total_salary_for_this_day
+            
+        return total_monthly_salary
+    except Exception as e:
+        st.error(f"خطأ في حساب الرواتب الشهرية: {e}")
+        return 0
+
+
+@st.cache_data(ttl=60)
+def calculate_menu_item_cost(menu_item_id, effective_date: date):
+    """
+    Calculates the cost of goods for a single menu item from its recipe,
+    respecting the stock item cost *as of* the effective_date.
+    """
+    try:
         recipe_response = db.table('menu_item_recipe').select(
-            'quantity_used, stock_items(cost_per_unit)'
+            'quantity_used, stock_item_id'
         ).eq('menu_item_id', menu_item_id).execute()
         
         if not recipe_response.data:
@@ -64,11 +125,17 @@ def calculate_menu_item_cost(menu_item_id):
         
         total_cost = 0
         for ingredient in recipe_response.data:
-            if ingredient.get('stock_items'):
-                total_cost += ingredient['quantity_used'] * ingredient['stock_items']['cost_per_unit']
+            # Get the most recent cost for this stock item on or before the date
+            cost_entry = db.table('stock_cost_history').select('cost_per_unit').eq('stock_item_id', ingredient['stock_item_id']).lte('start_date', effective_date.isoformat()).order('start_date', desc=True).limit(1).execute().data
+            
+            ingredient_cost = 0
+            if cost_entry:
+                ingredient_cost = cost_entry[0]['cost_per_unit']
+
+            total_cost += ingredient['quantity_used'] * ingredient_cost
         return total_cost
     except Exception as e:
-        st.error(f"Error calculating item cost: {e}")
+        st.error(f"خطأ في حساب تكلفة الصنف: {e}")
         return 0
 
 def process_daily_sales(server_id, sales_dict: dict, sales_date: date):
@@ -79,52 +146,47 @@ def process_daily_sales(server_id, sales_dict: dict, sales_date: date):
     3. Decrements stock based on recipe * total quantity.
     """
     try:
-        # 1. Create the single "order" for the day, with the correct date
-        # Use noon on the selected date as a safe default timestamp
         sales_timestamp = datetime.combine(sales_date, time(12, 0)).isoformat()
         order_response = db.table('orders').insert({
             'server_id': server_id,
-            'timestamp': sales_timestamp # Explicitly set the timestamp
+            'timestamp': sales_timestamp 
         }).execute()
         
         if not order_response.data:
-            st.error("Failed to create daily order.")
+            st.error("فشل في إنشاء الطلب اليومي.")
             return 0
         
         order_id = order_response.data[0]['id']
         total_revenue = 0
         
-        # 2. Process each menu item's total quantity
         for item_id, details in sales_dict.items():
             quantity = details['quantity']
             if quantity == 0:
                 continue
-
-            price_at_sale = details['sale_price']
             
-            # Calculate cost of goods for ONE item
-            cost_at_sale_per_item = calculate_menu_item_cost(item_id)
+            # Get the price for the item *as of the sales date*
+            price_entry = db.table('menu_price_history').select('sale_price').eq('menu_item_id', item_id).lte('start_date', sales_date.isoformat()).order('start_date', desc=True).limit(1).execute().data
+            price_at_sale = price_entry[0]['sale_price'] if price_entry else 0
             
-            # Insert into order_items with the total quantity
+            # Calculate cost of goods for ONE item *as of the sales date*
+            cost_at_sale_per_item = calculate_menu_item_cost(item_id, sales_date)
+            
             db.table('order_items').insert({
                 'order_id': order_id,
                 'menu_item_id': item_id,
                 'quantity': quantity,
-                'price_at_sale': price_at_sale, # Price for 1 item
-                'cost_at_sale': cost_at_sale_per_item # Cost for 1 item
+                'price_at_sale': price_at_sale, 
+                'cost_at_sale': cost_at_sale_per_item
             }).execute()
             
             total_revenue += price_at_sale * quantity
             
-            # 3. Decrement stock based on recipe
             recipe_response = db.table('menu_item_recipe').select(
                 'stock_item_id, quantity_used'
             ).eq('menu_item_id', item_id).execute()
             
             for ingredient in recipe_response.data:
                 total_amount_to_reduce = ingredient['quantity_used'] * quantity
-                
-                # Call the Supabase database function
                 db.rpc('decrement_stock', {
                     'item_id': ingredient['stock_item_id'],
                     'amount_to_reduce': total_amount_to_reduce
@@ -132,15 +194,15 @@ def process_daily_sales(server_id, sales_dict: dict, sales_date: date):
                 
         return total_revenue
     except Exception as e:
-        st.error(f"Error processing sales: {e}")
+        st.error(f"خطأ في معالجة المبيعات: {e}")
         return 0
 
 # --- UI Rendering Functions (The "Frontend") ---
 
 def render_monthly_dashboard():
     """Main dashboard showing current month's profit."""
-    st.title("☕ Monthly Dashboard")
-    st.header(f"Profit Report for {date.today().strftime('%B %Y')}")
+    st.title("☕ لوحة التحكم الشهرية")
+    st.header(f"تقرير الربح لشهر {date.today().strftime('%B %Y')}")
 
     selected_month_date = date.today()
     start_month_iso, end_month_iso, month_start_date = get_month_range(selected_month_date)
@@ -155,9 +217,8 @@ def render_monthly_dashboard():
         total_cogs = sum(item['cost_at_sale'] * item['quantity'] for item in sales_data)
         gross_profit = total_revenue - total_cogs
         
-        # 2. Get Salaries
-        salary_data = db.table('workers').select('salary').execute().data
-        total_salaries = sum(item['salary'] for item in salary_data)
+        # 2. Get Salaries (using new historical function)
+        total_salaries = get_monthly_salary_cost(selected_month_date)
         
         # 3. Get Other Expenses for the month
         expense_data = db.table('monthly_expenses').select('amount').eq(
@@ -170,298 +231,315 @@ def render_monthly_dashboard():
         net_profit = gross_profit - total_costs_operating
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Revenue", f"${total_revenue:.2f}")
-        col2.metric("Gross Profit (Revenue - COGS)", f"${gross_profit:.2f}")
-        col3.metric("Net Profit", f"${net_profit:.2f}", delta_color=("inverse" if net_profit < 0 else "normal"))
+        col1.metric("إجمالي الإيرادات", f"{total_revenue:.2f} $")
+        col2.metric("إجمالي الربح (الإيرادات - التكلفة)", f"{gross_profit:.2f} $")
+        col3.metric("صافي الربح", f"{net_profit:.2f} $", delta_color=("inverse" if net_profit < 0 else "normal"))
 
-        with st.expander("See Profit Breakdown"):
+        with st.expander("عرض تفاصيل الأرباح"):
             st.markdown(f"""
-            - **Total Revenue:** `{total_revenue:,.2f}`
-            - **Total Cost of Goods (COGS):** `({total_cogs:,.2f})`
-            - **Gross Profit:** `{gross_profit:,.2f}`
+            - **إجمالي الإيرادات:** `{total_revenue:,.2f}`
+            - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
+            - **إجمالي الربح:** `{gross_profit:,.2f}`
             ---
-            - **Staff Salaries:** `({total_salaries:,.2f})`
-            - **Other Expenses:** `({total_expenses:,.2f})`
-            - **Total Operating Costs:** `({total_costs_operating:,.2f})`
+            - **رواتب الموظفين:** `({total_salaries:,.2f})`
+            - **المصروفات الأخرى:** `({total_expenses:,.2f})`
+            - **إجمالي تكاليف التشغيل:** `({total_costs_operating:,.2f})`
             ---
-            - **NET PROFIT:** `{net_profit:,.2f}`
+            - **صافي الربح:** `{net_profit:,.2f}`
             """)
             
     except Exception as e:
-        st.error(f"Error generating monthly report: {e}")
+        st.error(f"خطأ في إنشاء التقرير الشهري: {e}")
 
 def render_daily_sales():
     """Page to enter the end-of-day sales for a server."""
-    st.title("📝 Record End of Day Sales")
-    st.info("Select a server, a date, and enter the *total quantity* of each item sold.")
+    st.title("📝 تسجيل المبيعات اليومية")
+    st.info("اختر نادلاً وتاريخاً، ثم أدخل الكمية الإجمالية لكل صنف تم بيعه.")
     
     try:
-        # Fetch data for forms
         servers = db.table('workers').select('id, name').eq('role', 'server').execute().data
-        menu_items = db.table('menu_items').select('id, name, sale_price').order('name').execute().data
+        menu_items = db.table('menu_items').select('id, name').order('name').execute().data
         
         if not servers:
-            st.warning("No servers found. Please add a 'server' in the 'Staff' page.")
+            st.warning("لم يتم العثور على نادلين. يرجى إضافة 'نادل' في صفحة 'الموظفون'.")
             return
-            
         if not menu_items:
-            st.warning("No menu items found. Please add items in the 'Menu' page.")
+            st.warning("لم يتم العثور على أصناف في القائمة. يرجى إضافة أصناف في صفحة 'القائمة'.")
             return
 
         col1, col2 = st.columns(2)
         with col1:
-            selected_server = st.selectbox(
-                "Select Server",
-                servers,
-                format_func=lambda x: x['name']
-            )
+            selected_server = st.selectbox("اختر النادل", servers, format_func=lambda x: x['name'])
         with col2:
-            selected_date = st.date_input("Select Sales Date", date.today())
+            selected_date = st.date_input("اختر تاريخ المبيعات", date.today())
         
         with st.form("daily_sales_form"):
-            st.header(f"Sales for {selected_server['name']} on {selected_date.strftime('%Y-%m-%d')}")
+            st.header(f"مبيعات {selected_server['name']} في {selected_date.strftime('%Y-%m-%d')}")
             
-            # Use session state to hold quantities
             sales_dict = {}
-            
             cols = st.columns(3)
             col_index = 0
             
             for item in menu_items:
+                # Get the price for this item on the selected date to display
+                price_entry = db.table('menu_price_history').select('sale_price').eq('menu_item_id', item['id']).lte('start_date', selected_date.isoformat()).order('start_date', desc=True).limit(1).execute().data
+                current_price = price_entry[0]['sale_price'] if price_entry else 0
+                
                 with cols[col_index % 3]:
                     quantity = st.number_input(
-                        f"Qty of {item['name']} (${item['sale_price']})", 
+                        f"كمية {item['name']} ({current_price}$)", 
                         min_value=0, 
                         step=1, 
                         key=f"qty_{item['id']}"
                     )
                     if quantity > 0:
-                        sales_dict[item['id']] = {
-                            "quantity": quantity,
-                            "sale_price": item['sale_price']
-                        }
+                        sales_dict[item['id']] = {"quantity": quantity}
                 col_index += 1
 
-            submitted = st.form_submit_button("Submit Daily Sales", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("إرسال المبيعات اليومية", type="primary", use_container_width=True)
             if submitted:
                 if selected_server and sales_dict and selected_date:
                     total_revenue = process_daily_sales(selected_server['id'], sales_dict, selected_date)
                     if total_revenue > 0:
-                        st.success(f"Successfully recorded sales for {selected_server['name']} on {selected_date}. Total revenue: ${total_revenue:.2f}")
-                        st.info("Stock has been updated.")
+                        st.success(f"تم تسجيل المبيعات بنجاح لـ {selected_server['name']} في {selected_date}. إجمالي الإيرادات: ${total_revenue:.2f}")
+                        st.info("تم تحديث المخزون.")
                     else:
-                        st.error("There was an error processing the sales.")
+                        st.error("حدث خطأ أثناء معالجة المبيعات.")
                 else:
-                    st.warning("Please select a server, a date, and enter at least one item quantity.")
+                    st.warning("يرجى اختيار نادل، تاريخ، وإدخال كمية صنف واحد على الأقل.")
                 
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f"حدث خطأ: {e}")
 
 def render_stock_management():
     """Page for viewing, adding, and restocking stock items."""
-    st.title("📦 Stock Management")
+    st.title("📦 إدارة المخزون")
     
-    tab1, tab2, tab3 = st.tabs(["View & Delete Stock", "Add New Stock Item", "Restock"])
+    tab1, tab2, tab3 = st.tabs(["عرض المخزون", "إضافة صنف جديد", "إعادة التخزين"])
     
-    # Fetch current stock for all tabs
     try:
         stock_data = db.table('stock_items').select('*').order('name').execute().data
     except Exception as e:
-        st.error(f"Failed to load stock: {e}")
+        st.error(f"فشل في تحميل المخزون: {e}")
         return
 
     with tab1:
-        st.header("Current Inventory")
-        st.info("Expand any item to see details or delete it.")
+        st.header("المخزون الحالي")
+        st.info("قم بتوسيع أي صنف لرؤية التفاصيل، تغيير التكلفة، أو الحذف.")
         
         if not stock_data:
-            st.warning("No stock items found.")
-            # We don't return here, so tab2 and tab3 can still render
+            st.warning("لم يتم العثور على أصناف في المخزون.")
         else:
             for item in stock_data:
                 color = ""
                 if (item['tracking_type'] in ['UNIT', 'MULTI-USE'] and item['current_quantity'] < 10) or \
                    (item['tracking_type'] == 'MANUAL' and item['current_quantity'] == 0):
                     color = "red"
+                
+                # Get current cost
+                cost_entry = db.table('stock_cost_history').select('cost_per_unit').eq('stock_item_id', item['id']).order('start_date', desc=True).limit(1).execute().data
+                current_cost = cost_entry[0]['cost_per_unit'] if cost_entry else 0
 
-                label = f":{color}[{item['name']}] (Current: {item['current_quantity']} {item['unit_of_measure']})"
+                label = f":{color}[{item['name']}] (الحالي: {item['current_quantity']} {item['unit_of_measure']}) | (التكلفة: ${current_cost:.4f})"
                 
                 with st.expander(label):
-                    st.write(f"**Tracking Type:** {item['tracking_type']}")
-                    st.write(f"**Cost Per Unit:** ${item['cost_per_unit']:.4f}")
-                    st.write(f"**Item ID:** `{item['id']}`")
+                    st.write(f"**نوع التتبع:** {item['tracking_type']}")
+                    st.write(f"**معرّف الصنف:** `{item['id']}`")
                     
-                    if st.button("Delete This Item", key=f"del_stock_{item['id']}", type="primary"):
+                    st.subheader("تغيير تكلفة الوحدة")
+                    st.info("سيتم تطبيق التكلفة الجديدة على جميع المبيعات والهدر من اليوم فصاعداً.")
+                    new_cost = st.number_input("التكلفة الجديدة للوحدة", min_value=0.0, format="%.4f", key=f"cost_{item['id']}", value=float(current_cost))
+                    if st.button("تحديث التكلفة", key=f"upd_cost_{item['id']}"):
                         try:
-                            # Check if item is in a recipe
+                            db.table('stock_cost_history').insert({
+                                'stock_item_id': item['id'],
+                                'cost_per_unit': new_cost,
+                                'start_date': date.today().isoformat()
+                            }).execute()
+                            st.success(f"تم تحديث تكلفة {item['name']} إلى ${new_cost:.4f} بدءاً من اليوم.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"خطأ في تحديث التكلفة: {e}")
+
+                    st.divider()
+                    if st.button("حذف هذا الصنف", key=f"del_stock_{item['id']}", type="primary"):
+                        try:
                             recipe_links = db.table('menu_item_recipe').select('id').eq('stock_item_id', item['id']).execute().data
                             if recipe_links:
-                                st.error(f"Cannot delete '{item['name']}'. It is used in {len(recipe_links)} recipe(s). Please remove it from all recipes first.")
+                                st.error(f"لا يمكن حذف '{item['name']}'. يتم استخدامه في {len(recipe_links)} وصفة. يرجى إزالته من جميع الوصفات أولاً.")
                             else:
-                                db.table('stock_items').delete().eq('id', item['id']).execute()
-                                st.success(f"Deleted {item['name']}.")
+                                db.table('stock_cost_history').delete().eq('stock_item_id', item['id']).execute() # Delete history
+                                db.table('stock_items').delete().eq('id', item['id']).execute() # Delete item
+                                st.success(f"تم حذف {item['name']}.")
                                 st.rerun()
                         except Exception as e:
-                            st.error(f"Error deleting item: {e}")
+                            st.error(f"خطأ في حذف الصنف: {e}")
 
     with tab2:
-        st.header("Add New Stock Item")
+        st.header("إضافة صنف جديد للمخزون")
         with st.form("new_stock_item_form"):
-            name = st.text_input("Item Name (e.g., 'Coffee Beans', 'Bottle of Coke', 'Napkins')")
-            tracking_type = st.selectbox(
-                "Tracking Type",
-                options=['UNIT', 'MULTI-USE', 'MANUAL'],
-                help="""
-                - **UNIT**: Tracked one-by-one (e.g., bottles, cans).
-                - **MULTI-USE**: Used in portions (e.g., coffee beans, milk).
-                - **MANUAL**: Tracked when it runs out (e.g., napkins, cleaning spray).
-                """
-            )
-            current_quantity = st.number_input("Initial Quantity", min_value=0.0, step=1.0)
-            unit_of_measure = st.text_input("Unit of Measure (e.g., 'g', 'ml', 'pcs', 'pack')")
-            cost_per_unit = st.number_input("Cost Per Unit (Your cost, e.g., 0.02 for 1g coffee)", min_value=0.0, format="%.4f")
+            name = st.text_input("اسم الصنف (مثل 'حبوب البن'، 'علبة كوكا كولا'، 'مناديل')")
+            tracking_type = st.selectbox("نوع التتبع", options=['UNIT', 'MULTI-USE', 'MANUAL'], help="...")
+            current_quantity = st.number_input("الكمية الأولية", min_value=0.0, step=1.0)
+            unit_of_measure = st.text_input("وحدة القياس (مثل 'g'، 'ml'، 'pcs'، 'pack')")
+            cost_per_unit = st.number_input("التكلفة الأولية للوحدة (تكلفتك)", min_value=0.0, format="%.4f")
             
-            submitted = st.form_submit_button("Add Item")
+            submitted = st.form_submit_button("إضافة الصنف")
             if submitted:
-                # === FIX ===
-                # Changed validation to only check for 'name', as other fields
-                # have valid defaults (like 0 for cost).
                 if not name:
-                    st.warning("Please fill out the 'Item Name'.")
+                    st.warning("يرجى ملء 'اسم الصنف'.")
                 else:
                     try:
-                        db.table('stock_items').insert({
+                        # 1. Insert the stock item
+                        item_response = db.table('stock_items').insert({
                             'name': name,
                             'tracking_type': tracking_type,
                             'current_quantity': current_quantity,
-                            'unit_of_measure': unit_of_measure,
-                            'cost_per_unit': cost_per_unit
+                            'unit_of_measure': unit_of_measure
                         }).execute()
-                        st.success(f"Added {name} to stock!")
+                        
+                        new_item_id = item_response.data[0]['id']
+                        
+                        # 2. Insert its initial cost into the history table
+                        db.table('stock_cost_history').insert({
+                            'stock_item_id': new_item_id,
+                            'cost_per_unit': cost_per_unit,
+                            'start_date': date.today().isoformat()
+                        }).execute()
+                        
+                        st.success(f"تمت إضافة {name} إلى المخزون!")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Error adding item: {e}")
+                        st.error(f"خطأ في إضافة الصنف: {e}")
 
     with tab3:
-        st.header("Restock Item")
-        
+        st.header("إعادة التخزين")
         if not stock_data:
-            st.warning("No stock items to restock.")
+            st.warning("لا توجد أصناف لإعادة تخزينها.")
             return
-
-        st.info("Add to existing stock quantity or mark a 'MANUAL' item as restocked.")
         
         item_to_restock = st.selectbox(
-            "Select Item to Restock",
+            "اختر الصنف لإعادة التخزين",
             stock_data,
-            format_func=lambda x: f"{x['name']} (Current: {x['current_quantity']} {x['unit_of_measure']})"
+            format_func=lambda x: f"{x['name']} (الحالي: {x['current_quantity']} {x['unit_of_measure']})"
         )
         
         if item_to_restock:
             if item_to_restock['tracking_type'] in ['UNIT', 'MULTI-USE']:
-                amount_to_add = st.number_input("Quantity to Add", min_value=0.0, step=1.0)
-                if st.button("Add to Stock"):
+                amount_to_add = st.number_input("الكمية المضافة", min_value=0.0, step=1.0)
+                if st.button("إضافة إلى المخزون"):
                     new_quantity = item_to_restock['current_quantity'] + amount_to_add
                     try:
-                        db.table('stock_items').update(
-                            {'current_quantity': new_quantity}
-                        ).eq('id', item_to_restock['id']).execute()
-                        st.success(f"Restocked {item_to_restock['name']}. New quantity: {new_quantity}")
+                        db.table('stock_items').update({'current_quantity': new_quantity}).eq('id', item_to_restock['id']).execute()
+                        st.success(f"تمت إعادة تخزين {item_to_restock['name']}. الكمية الجديدة: {new_quantity}")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Error restocking: {e}")
+                        st.error(f"خطأ في إعادة التخزين: {e}")
             else: # MANUAL tracking
-                if st.button(f"Mark '{item_to_restock['name']}' as RESTOCKED"):
+                if st.button(f"وضع علامة 'تمت إعادة التخزين' لـ '{item_to_restock['name']}'"):
                     try:
-                        # For manual items, we just set quantity to 1 (meaning "in stock")
-                        db.table('stock_items').update(
-                            {'current_quantity': 1}
-                        ).eq('id', item_to_restock['id']).execute()
-                        st.success(f"Marked {item_to_restock['name']} as restocked.")
+                        db.table('stock_items').update({'current_quantity': 1}).eq('id', item_to_restock['id']).execute()
+                        st.success(f"تم وضع علامة 'تمت إعادة التخزين' لـ {item_to_restock['name']}.")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Error restocking: {e}")
+                        st.error(f"خطأ في إعادة التخزين: {e}")
 
 def render_menu_management():
     """Page for managing menu items and their recipes."""
-    st.title("📋 Menu & Recipe Management")
+    st.title("📋 إدارة القائمة والوصفات")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.header("Add New Menu Item")
+        st.header("إضافة صنف جديد للقائمة")
         with st.form("new_menu_item_form"):
-            name = st.text_input("Menu Item Name (e.g., 'Latte')")
-            sale_price = st.number_input("Sale Price ($)", min_value=0.0, step=0.01)
-            submitted = st.form_submit_button("Add Menu Item")
+            name = st.text_input("اسم صنف القائمة (مثل 'لاتيه')")
+            sale_price = st.number_input("سعر البيع الأولي ($)", min_value=0.0, step=0.01)
+            submitted = st.form_submit_button("إضافة صنف للقائمة")
             
             if submitted and name and sale_price > 0:
                 try:
-                    db.table('menu_items').insert({
-                        'name': name,
-                        'sale_price': sale_price
+                    # 1. Insert the menu item
+                    item_response = db.table('menu_items').insert({'name': name}).execute()
+                    new_item_id = item_response.data[0]['id']
+                    
+                    # 2. Insert its initial price into the history table
+                    db.table('menu_price_history').insert({
+                        'menu_item_id': new_item_id,
+                        'sale_price': sale_price,
+                        'start_date': date.today().isoformat()
                     }).execute()
-                    st.success(f"Added {name} to menu.")
+                    
+                    st.success(f"تمت إضافة {name} إلى القائمة.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error adding item: {e}")
+                    st.error(f"خطأ في إضافة الصنف: {e}")
     
     with col2:
-        st.header("View & Delete Menu Items")
+        st.header("عرض وتعديل أسعار القائمة")
         try:
             menu_data = db.table('menu_items').select('*').order('name').execute().data
             if not menu_data:
-                st.warning("No menu items added yet.")
+                st.warning("لم يتم إضافة أصناف للقائمة بعد.")
             else:
                 for item in menu_data:
-                    with st.expander(f"{item['name']} - ${item['sale_price']}"):
-                        if st.button("Delete This Menu Item", key=f"del_menu_{item['id']}", type="primary"):
+                    # Get current price
+                    price_entry = db.table('menu_price_history').select('sale_price').eq('menu_item_id', item['id']).order('start_date', desc=True).limit(1).execute().data
+                    current_price = price_entry[0]['sale_price'] if price_entry else 0
+                    
+                    with st.expander(f"{item['name']} - (السعر الحالي: ${current_price})"):
+                        st.subheader("تغيير سعر البيع")
+                        st.info("سيتم تطبيق السعر الجديد على جميع المبيعات من اليوم فصاعداً.")
+                        new_price = st.number_input("السعر الجديد ($)", min_value=0.0, step=0.01, key=f"price_{item['id']}", value=float(current_price))
+                        if st.button("تحديث السعر", key=f"upd_price_{item['id']}"):
                             try:
-                                # Must delete recipe links first
-                                db.table('menu_item_recipe').delete().eq('menu_item_id', item['id']).execute()
-                                # Then delete the item itself
-                                db.table('menu_items').delete().eq('id', item['id']).execute()
-                                st.success(f"Deleted {item['name']}.")
+                                db.table('menu_price_history').insert({
+                                    'menu_item_id': item['id'],
+                                    'sale_price': new_price,
+                                    'start_date': date.today().isoformat()
+                                }).execute()
+                                st.success(f"تم تحديث سعر {item['name']} إلى ${new_price} بدءاً من اليوم.")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Error deleting: {e}")
+                                st.error(f"خطأ في تحديث السعر: {e}")
+                        
+                        st.divider()
+                        if st.button("حذف صنف القائمة هذا", key=f"del_menu_{item['id']}", type="primary"):
+                            try:
+                                db.table('menu_item_recipe').delete().eq('menu_item_id', item['id']).execute()
+                                db.table('menu_price_history').delete().eq('menu_item_id', item['id']).execute()
+                                db.table('menu_items').delete().eq('id', item['id']).execute()
+                                st.success(f"تم حذف {item['name']}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"خطأ في الحذف: {e}")
                             
         except Exception as e:
-            st.error(f"Failed to load menu: {e}")
+            st.error(f"فشل في تحميل القائمة: {e}")
 
     st.divider()
     
-    st.header("Define Menu Recipe")
-    st.info("Link what you sell (e.g., 'Latte') to what you have in stock (e.g., 'Coffee Beans').")
+    st.header("تحديد وصفة القائمة")
+    st.info("اربط ما تبيعه (مثل 'لاتيه') بما لديك في المخزون (مثل 'حبوب البن').")
     
     try:
         menu_data = db.table('menu_items').select('id, name').execute().data
         stock_data = db.table('stock_items').select('id, name, unit_of_measure').execute().data
         
         if not menu_data or not stock_data:
-            st.warning("Please add menu items and stock items first.")
+            st.warning("يرجى إضافة أصناف القائمة وأصناف المخزون أولاً.")
             return
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            menu_item = st.selectbox(
-                "Select Menu Item",
-                menu_data,
-                format_func=lambda x: x['name'],
-                key="recipe_menu_item"
-            )
+            menu_item = st.selectbox("اختر صنف القائمة", menu_data, format_func=lambda x: x['name'], key="recipe_menu_item")
         with col2:
-            stock_item = st.selectbox(
-                "Select Stock Ingredient",
-                stock_data,
-                format_func=lambda x: f"{x['name']} ({x['unit_of_measure']})",
-                key="recipe_stock_item"
-            )
+            stock_item = st.selectbox("اختر مكون المخزون", stock_data, format_func=lambda x: f"{x['name']} ({x['unit_of_measure']})", key="recipe_stock_item")
         with col3:
             unit = next((item['unit_of_measure'] for item in stock_data if item['id'] == stock_item['id']), 'units')
-            quantity_used = st.number_input(f"Quantity Used ({unit})", min_value=0.0, step=0.1, key="recipe_qty")
+            quantity_used = st.number_input(f"الكمية المستخدمة ({unit})", min_value=0.0, step=0.1, key="recipe_qty")
             
-        if st.button("Add Ingredient to Recipe", use_container_width=True):
+        if st.button("إضافة مكون إلى الوصفة", use_container_width=True):
             if menu_item and stock_item and quantity_used > 0:
                 try:
                     db.table('menu_item_recipe').insert({
@@ -469,87 +547,118 @@ def render_menu_management():
                         'stock_item_id': stock_item['id'],
                         'quantity_used': quantity_used
                     }).execute()
-                    st.success(f"Added {quantity_used} {unit} of {stock_item['name']} to {menu_item['name']} recipe.")
+                    st.success(f"تمت إضافة {quantity_used} {unit} من {stock_item['name']} إلى وصفة {menu_item['name']}.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error adding to recipe: {e}")
+                    st.error(f"خطأ في إضافة الوصفة: {e}")
                     
-        # View current recipe for selected item
         if menu_item:
             recipe = db.table('menu_item_recipe').select(
                 'id, quantity_used, stock_items(name, unit_of_measure)'
             ).eq('menu_item_id', menu_item['id']).execute().data
             
             if recipe:
-                st.subheader(f"Recipe for {menu_item['name']}")
+                st.subheader(f"وصفة {menu_item['name']}")
                 for r in recipe:
                     if r.get('stock_items'):
                         col1, col2 = st.columns([4,1])
-                        col1.write(f"- {r['quantity_used']} {r['stock_items']['unit_of_measure']} of {r['stock_items']['name']}")
-                        if col2.button("Remove", key=f"del_recipe_{r['id']}", use_container_width=True):
+                        col1.write(f"- {r['quantity_used']} {r['stock_items']['unit_of_measure']} من {r['stock_items']['name']}")
+                        if col2.button("إزالة", key=f"del_recipe_{r['id']}", use_container_width=True):
                             db.table('menu_item_recipe').delete().eq('id', r['id']).execute()
                             st.rerun()
             
     except Exception as e:
-        st.error(f"Error loading recipe data: {e}")
+        st.error(f"خطأ في تحميل بيانات الوصفة: {e}")
 
 
 def render_staff_and_expenses():
     """Page for managing workers and monthly expenses."""
-    st.title("👥 Staff & 🧾 Expenses")
+    st.title("👥 الموظفون و 🧾 المصروفات")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.header("Manage Staff")
+        st.header("إدارة الموظفين")
         with st.form("new_worker_form"):
-            name = st.text_input("Worker Name")
-            role = st.selectbox("Role", ["server", "barista"])
-            salary = st.number_input("Monthly Salary ($)", min_value=0.0, step=50.0)
-            submitted = st.form_submit_button("Add Worker")
+            name = st.text_input("اسم الموظف")
+            role = st.selectbox("الوظيفة", ["server", "barista"], format_func=lambda x: "نادل" if x == "server" else "باريستا")
+            salary = st.number_input("الراتب اليومي الأولي ($)", min_value=0.0, step=1.0)
+            submitted = st.form_submit_button("إضافة موظف")
             
             if submitted and name and role and salary >= 0:
                 try:
-                    db.table('workers').insert({
+                    # 1. Insert worker
+                    worker_response = db.table('workers').insert({
                         'name': name,
-                        'role': role,
-                        'salary': salary
+                        'role': role
                     }).execute()
-                    st.success(f"Added {name}.")
+                    new_worker_id = worker_response.data[0]['id']
+                    
+                    # 2. Insert initial salary
+                    db.table('salary_history').insert({
+                        'worker_id': new_worker_id,
+                        'daily_salary': salary,
+                        'start_date': date.today().isoformat()
+                    }).execute()
+                    
+                    st.success(f"تمت إضافة {name} براتب يومي ${salary}.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error adding worker: {e}")
+                    st.error(f"خطأ في إضافة الموظف: {e}")
         
-        st.subheader("Current Staff")
+        st.subheader("الموظفون الحاليون")
         try:
-            staff_data = db.table('workers').select('id, name, role, salary').execute().data
+            staff_data = db.table('workers').select('id, name, role').execute().data
             if not staff_data:
-                st.warning("No staff added yet.")
+                st.warning("لم تتم إضافة موظفين بعد.")
             else:    
                 for worker in staff_data:
-                    with st.expander(f"{worker['name']} ({worker['role']}) - ${worker['salary']}/month"):
-                        if st.button("Delete Worker", key=f"del_worker_{worker['id']}", type="primary"):
+                    role_ar = "نادل" if worker['role'] == "server" else "باريستا"
+                    
+                    # Get current salary
+                    salary_entry = db.table('salary_history').select('daily_salary').eq('worker_id', worker['id']).order('start_date', desc=True).limit(1).execute().data
+                    current_salary = salary_entry[0]['daily_salary'] if salary_entry else 0
+                    
+                    with st.expander(f"{worker['name']} ({role_ar}) - ${current_salary}/يوم"):
+                        
+                        st.subheader("تغيير الراتب")
+                        st.info("سيتم تطبيق الراتب الجديد بدءاً من اليوم.")
+                        new_salary = st.number_input("الراتب اليومي الجديد ($)", min_value=0.0, step=1.0, key=f"salary_{worker['id']}", value=float(current_salary))
+                        if st.button("تحديث الراتب", key=f"upd_salary_{worker['id']}"):
                             try:
-                                # Check if worker has orders
+                                db.table('salary_history').insert({
+                                    'worker_id': worker['id'],
+                                    'daily_salary': new_salary,
+                                    'start_date': date.today().isoformat()
+                                }).execute()
+                                st.success(f"تم تحديث راتب {worker['name']} إلى ${new_salary} بدءاً من اليوم.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"خطأ في تحديث الراتب: {e}")
+                        
+                        st.divider()
+                        if st.button("حذف الموظف", key=f"del_worker_{worker['id']}", type="primary"):
+                            try:
                                 orders = db.table('orders').select('id').eq('server_id', worker['id']).execute().data
                                 if orders:
-                                    st.error(f"Cannot delete {worker['name']}. They are linked to {len(orders)} order(s).")
+                                    st.error(f"لا يمكن حذف {worker['name']}. هو/هي مرتبط بـ {len(orders)} طلب.")
                                 else:
-                                    db.table('workers').delete().eq('id', worker['id']).execute()
-                                    st.success(f"Deleted {worker['name']}.")
+                                    db.table('salary_history').delete().eq('worker_id', worker['id']).execute() # Delete salary history
+                                    db.table('workers').delete().eq('id', worker['id']).execute() # Delete worker
+                                    st.success(f"تم حذف {worker['name']}.")
                                     st.rerun()
                             except Exception as e:
-                                st.error(f"Error deleting: {e}")
+                                st.error(f"خطأ في الحذف: {e}")
         except Exception as e:
-            st.error(f"Failed to load staff: {e}")
+            st.error(f"فشل في تحميل الموظفين: {e}")
 
     with col2:
-        st.header("Manage Monthly Expenses")
+        st.header("إدارة المصروفات الشهرية")
         with st.form("new_expense_form"):
-            month = st.date_input("Month", date.today().replace(day=1))
-            description = st.text_input("Description (e.g., 'Electricity', 'Rent')")
-            amount = st.number_input("Amount ($)", min_value=0.0, step=1.0)
-            submitted = st.form_submit_button("Add Expense")
+            month = st.date_input("الشهر", date.today().replace(day=1))
+            description = st.text_input("الوصف (مثل 'كهرباء'، 'إيجار')")
+            amount = st.number_input("المبلغ ($)", min_value=0.0, step=1.0)
+            submitted = st.form_submit_button("إضافة مصروف")
             
             if submitted and month and description and amount > 0:
                 try:
@@ -558,41 +667,42 @@ def render_staff_and_expenses():
                         'description': description,
                         'amount': amount
                     }).execute()
-                    st.success(f"Added {description} expense.")
+                    st.success(f"تمت إضافة مصروف {description}.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error adding expense: {e}")
+                    st.error(f"خطأ في إضافة المصروف: {e}")
 
-        st.subheader("Logged Expenses")
+        st.subheader("المصروفات المسجلة")
         try:
             expense_data = db.table('monthly_expenses').select('id, month, description, amount').order('month', desc=True).execute().data
             if not expense_data:
-                st.warning("No expenses logged yet.")
+                st.warning("لم يتم تسجيل مصروفات بعد.")
             else:
                 for expense in expense_data:
                     with st.expander(f"{expense['month']} - {expense['description']} - ${expense['amount']}"):
-                        if st.button("Delete Expense", key=f"del_exp_{expense['id']}", type="primary"):
+                        if st.button("حذف المصروف", key=f"del_exp_{expense['id']}", type="primary"):
                             try:
                                 db.table('monthly_expenses').delete().eq('id', expense['id']).execute()
-                                st.success(f"Deleted {expense['description']}.")
+                                st.success(f"تم حذف {expense['description']}.")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Error deleting: {e}")
+                                st.error(f"خطأ في الحذف: {e}")
         except Exception as e:
-            st.error(f"Failed to load expenses: {e}")
+            st.error(f"فشل في تحميل المصروفات: {e}")
 
 def render_reports():
     """Page for viewing profit reports."""
-    st.title("📈 Profit Reports")
+    st.title("📈 تقارير الأرباح")
     
-    report_type = st.radio("Select Report Type", ["Daily", "Monthly"], horizontal=True)
+    report_type = st.radio("اختر نوع التقرير", ["يومي", "شهري"], horizontal=True)
     
-    if report_type == "Daily":
-        st.subheader("Daily Profit Report")
-        selected_date = st.date_input("Select Date", date.today())
+    if report_type == "يومي":
+        st.subheader("تقرير الربح اليومي")
+        selected_date = st.date_input("اختر التاريخ", date.today())
         
         start_day, end_day = get_today_range(selected_date)
         
+        # 1. Get Revenue and COGS
         sales_data = db.table('order_items').select(
             'price_at_sale, cost_at_sale, quantity, orders!inner(timestamp)'
         ).gte('orders.timestamp', start_day).lte('orders.timestamp', end_day).execute().data
@@ -601,14 +711,32 @@ def render_reports():
         total_cogs = sum(item['cost_at_sale'] * item['quantity'] for item in sales_data)
         gross_profit = total_revenue - total_cogs
         
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Revenue", f"${total_revenue:.2f}")
-        col2.metric("Total Cost of Goods", f"${total_cogs:.2f}")
-        col3.metric("Gross Profit", f"${gross_profit:.2f}")
+        # 2. Get Salaries for the day (using new historical function)
+        total_salaries_today = get_daily_salary_cost(selected_date)
+        
+        # 3. Calculate Net Profit
+        net_profit_today = gross_profit - total_salaries_today
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("إجمالي الإيرادات", f"{total_revenue:.2f} $")
+        col2.metric("إجمالي الربح", f"{gross_profit:.2f} $")
+        col3.metric("رواتب اليوم", f"({total_salaries_today:.2f}) $")
+        col4.metric("صافي الربح اليومي", f"{net_profit_today:.2f} $", delta_color=("inverse" if net_profit_today < 0 else "normal"))
 
-    if report_type == "Monthly":
-        st.subheader("Monthly Profit Report")
-        selected_month_date = st.date_input("Select Month", date.today())
+        with st.expander("عرض تفاصيل تقرير اليوم"):
+            st.markdown(f"""
+            - **إجمالي الإيرادات:** `{total_revenue:,.2f}`
+            - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
+            - **إجمالي الربح:** `{gross_profit:,.2f}`
+            ---
+            - **رواتب اليوم:** `({total_salaries_today:,.2f})`
+            ---
+            - **صافي الربح اليومي:** `{net_profit_today:,.2f}`
+            """)
+
+    if report_type == "شهري":
+        st.subheader("تقرير الربح الشهري")
+        selected_month_date = st.date_input("اختر الشهر", date.today())
         
         start_month_iso, end_month_iso, month_start_date = get_month_range(selected_month_date)
         
@@ -622,9 +750,8 @@ def render_reports():
             total_cogs = sum(item['cost_at_sale'] * item['quantity'] for item in sales_data)
             gross_profit = total_revenue - total_cogs
             
-            # 2. Get Salaries
-            salary_data = db.table('workers').select('salary').execute().data
-            total_salaries = sum(item['salary'] for item in salary_data)
+            # 2. Get Salaries (using new historical function)
+            total_salaries = get_monthly_salary_cost(selected_month_date)
             
             # 3. Get Other Expenses for the month
             expense_data = db.table('monthly_expenses').select('amount').eq(
@@ -636,51 +763,49 @@ def render_reports():
             total_costs_operating = total_salaries + total_expenses
             net_profit = gross_profit - total_costs_operating
             
-            st.subheader(f"Report for {selected_month_date.strftime('%B %Y')}")
+            st.subheader(f"تقرير لشهر {selected_month_date.strftime('%B %Y')}")
             
             col1, col2, col3 = st.columns(3)
-            col1.metric("Total Revenue", f"${total_revenue:.2f}")
-            col2.metric("Gross Profit (Revenue - COGS)", f"${gross_profit:.2f}")
-            col3.metric("Net Profit", f"${net_profit:.2f}", delta_color=("inverse" if net_profit < 0 else "normal"))
+            col1.metric("إجمالي الإيرادات", f"{total_revenue:.2f} $")
+            col2.metric("إجمالي الربح (الإيرادات - التكلفة)", f"{gross_profit:.2f} $")
+            col3.metric("صافي الربح", f"{net_profit:.2f} $", delta_color=("inverse" if net_profit < 0 else "normal"))
 
-            with st.expander("See Profit Breakdown"):
+            with st.expander("عرض تفاصيل الأرباح"):
                 st.markdown(f"""
-                - **Total Revenue:** `{total_revenue:,.2f}`
-                - **Total Cost of Goods (COGS):** `({total_cogs:,.2f})`
-                - **Gross Profit:** `{gross_profit:,.2f}`
+                - **إجمالي الإيرادات:** `{total_revenue:,.2f}`
+                - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
+                - **إجمالي الربح:** `{gross_profit:,.2f}`
                 ---
-                - **Staff Salaries:** `({total_salaries:,.2f})`
-                - **Other Expenses:** `({total_expenses:,.2f})`
-                - **Total Operating Costs:** `({total_costs_operating:,.2f})`
+                - **رواتب الموظفين:** `({total_salaries:,.2f})`
+                - **المصروفات الأخرى:** `({total_expenses:,.2f})`
+                - **إجمالي تكاليف التشغيل:** `({total_costs_operating:,.2f})`
                 ---
-                - **NET PROFIT:** `{net_profit:,.2f}`
+                - **صافي الربح:** `{net_profit:,.2f}`
                 """)
                 
         except Exception as e:
-            st.error(f"Error generating monthly report: {e}")
+            st.error(f"خطأ في إنشاء التقرير الشهري: {e}")
 
 def render_manage_orders():
     """Page to view and delete past daily sales orders."""
-    st.title("🛒 Manage Daily Orders")
-    st.info("Here you can review and delete entire daily sales reports. Deleting an order will remove it from all profit calculations. It will NOT restock the items.")
+    st.title("🛒 إدارة الطلبات اليومية")
+    st.info("هنا يمكنك مراجعة وحذف تقارير المبيعات اليومية بأكملها. حذف طلب سيزيله من جميع حسابات الأرباح. لن يتم إعادة تخزين الأصناف.")
 
     try:
-        # Fetch all orders, joining with workers to get server name
         orders = db.table('orders').select(
             'id, timestamp, workers(name)'
         ).order('timestamp', desc=True).execute().data
 
         if not orders:
-            st.warning("No orders found.")
+            st.warning("لم يتم العثور على طلبات.")
             return
 
         for order in orders:
-            server_name = order['workers']['name'] if order.get('workers') else "Unknown Server"
+            server_name = order['workers']['name'] if order.get('workers') else "نادل غير معروف"
             order_time = datetime.fromisoformat(order['timestamp']).strftime('%Y-%m-%d %I:%M %p')
             
-            with st.expander(f"**{server_name}**'s report from **{order_time}**"):
+            with st.expander(f"تقرير **{server_name}** من **{order_time}**"):
                 
-                # Fetch all items for this order
                 items = db.table('order_items').select(
                     'quantity, price_at_sale, cost_at_sale, menu_items(name)'
                 ).eq('order_id', order['id']).execute().data
@@ -695,99 +820,172 @@ def render_manage_orders():
                             revenue = item['quantity'] * item['price_at_sale']
                             cost = item['quantity'] * item['cost_at_sale']
                             item_data.append({
-                                "Item": item_name,
-                                "Quantity": item['quantity'],
-                                "Unit Price": f"${item['price_at_sale']:.2f}",
-                                "Total Revenue": f"${revenue:.2f}",
-                                "Total Cost": f"${cost:.2f}"
+                                "الصنف": item_name,
+                                "الكمية": item['quantity'],
+                                "سعر الوحدة": f"${item['price_at_sale']:.2f}",
+                                "إجمالي الإيرادات": f"${revenue:.2f}",
+                                "إجمالي التكلفة": f"${cost:.2f}"
                             })
                             total_revenue += revenue
                             total_cost += cost
                     
                     st.dataframe(pd.DataFrame(item_data), hide_index=True, use_container_width=True)
-                    st.markdown(f"**Total Revenue:** `${total_revenue:.2f}` | **Total Cost:** `${total_cost:.2f}`")
+                    st.markdown(f"**إجمالي الإيرادات:** `${total_revenue:.2f}` | **إجمالي التكلفة:** `${total_cost:.2f}`")
 
                 else:
-                    st.write("This order has no items.")
+                    st.write("هذا الطلب لا يحتوي على أصناف.")
 
-                if st.button("Delete This Entire Order", key=f"del_order_{order['id']}", type="primary"):
+                if st.button("حذف هذا الطلب بالكامل", key=f"del_order_{order['id']}", type="primary"):
                     try:
-                        # Deleting the order will cascade and delete all associated order_items
                         db.table('orders').delete().eq('id', order['id']).execute()
-                        st.success(f"Deleted order from {order_time}.")
+                        st.success(f"تم حذف الطلب من {order_time}.")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Error deleting order: {e}")
+                        st.error(f"خطأ في حذف الطلب: {e}")
                         
     except Exception as e:
-        st.error(f"Error loading orders: {e}")
+        st.error(f"خطأ في تحميل الطلبات: {e}")
+
+def render_wastage():
+    """Page to record menu items that were wasted (no revenue, stock decreased)."""
+    st.title("🗑️ تسجيل الهدر")
+    st.info("سجل الأصناف التي تم هدرها. سيؤدي هذا إلى تقليل المخزون وإضافة التكلفة إلى مصروفاتك الشهرية.")
+    
+    try:
+        menu_items = db.table('menu_items').select('id, name').order('name').execute().data
+            
+        if not menu_items:
+            st.warning("لم يتم العثور على أصناف في القائمة. يرجى إضافة أصناف في صفحة 'القائمة'.")
+            return
+
+        selected_date = st.date_input("اختر تاريخ الهدر", date.today())
+        
+        with st.form("wastage_form"):
+            st.header(f"الهدر في {selected_date.strftime('%Y-%m-%d')}")
+            
+            wastage_dict = {}
+            total_cost_of_wastage = 0
+            
+            cols = st.columns(3)
+            col_index = 0
+            
+            for item in menu_items:
+                with cols[col_index % 3]:
+                    quantity = st.number_input(
+                        f"كمية هدر {item['name']}", 
+                        min_value=0, 
+                        step=1, 
+                        key=f"waste_qty_{item['id']}"
+                    )
+                    if quantity > 0:
+                        # Calculate cost as of the selected wastage date
+                        item_cost = calculate_menu_item_cost(item['id'], selected_date)
+                        wastage_dict[item['id']] = {
+                            "quantity": quantity,
+                            "cost": item_cost
+                        }
+                        total_cost_of_wastage += item_cost * quantity
+                col_index += 1
+
+            submitted = st.form_submit_button("إرسال تقرير الهدر", type="primary", use_container_width=True)
+            if submitted:
+                if not wastage_dict:
+                    st.warning("يرجى إدخال كمية صنف واحد على الأقل.")
+                    return
+
+                try:
+                    for item_id, details in wastage_dict.items():
+                        recipe_response = db.table('menu_item_recipe').select(
+                            'stock_item_id, quantity_used'
+                        ).eq('menu_item_id', item_id).execute()
+                        
+                        for ingredient in recipe_response.data:
+                            total_amount_to_reduce = ingredient['quantity_used'] * details['quantity']
+                            db.rpc('decrement_stock', {
+                                'item_id': ingredient['stock_item_id'],
+                                'amount_to_reduce': total_amount_to_reduce
+                            }).execute()
+                    
+                    month_start = selected_date.replace(day=1)
+                    db.table('monthly_expenses').insert({
+                        'month': month_start.isoformat(),
+                        'description': f"هدر في {selected_date.isoformat()}",
+                        'amount': total_cost_of_wastage
+                    }).execute()
+                    
+                    st.success(f"تم تسجيل الهدر بنجاح. التكلفة الإجمالية: ${total_cost_of_wastage:.2f}")
+                    st.info("تم تحديث المخزون وإضافة التكلفة إلى المصروفات.")
+                
+                except Exception as e:
+                    st.error(f"حدث خطأ أثناء معالجة الهدر: {e}")
+                
+    except Exception as e:
+        st.error(f"حدث خطأ: {e}")
 
 
 # --- Main Application Function ---
 def main_app():
     """Renders the main application UI *after* successful login."""
     
-    st.sidebar.title("Cafe Manager")
+    st.sidebar.title("مدير المقهى")
     
-    # Add a logout button to the sidebar
-    if st.sidebar.button("Logout"):
+    if st.sidebar.button("تسجيل الخروج"):
         st.session_state.logged_in = False
         st.rerun()
 
     page = st.sidebar.radio(
-        "Navigation",
-        ["Monthly Dashboard", "Record Daily Sales", "Manage Orders", "Stock Management", "Menu Management", "Staff & Expenses", "Reports"]
+        "التنقل",
+        ["لوحة التحكم الشهرية", "تسجيل المبيعات اليومية", "إدارة الطلبات", "إدارة المخزون", "تسجيل الهدر", "إدارة القائمة", "الموظفون والمصروفات", "التقارير"]
     )
 
-    if page == "Monthly Dashboard":
+    if page == "لوحة التحكم الشهرية":
         render_monthly_dashboard()
-    elif page == "Record Daily Sales":
+    elif page == "تسجيل المبيعات اليومية":
         render_daily_sales()
-    elif page == "Manage Orders":
+    elif page == "إدارة الطلبات":
         render_manage_orders()
-    elif page == "Stock Management":
+    elif page == "إدارة المخزون":
         render_stock_management()
-    elif page == "Menu Management":
+    elif page == "تسجيل الهدر":
+        render_wastage()
+    elif page == "إدارة القائمة":
         render_menu_management()
-    elif page == "Staff & Expenses":
+    elif page == "الموظفون والمصروفات":
         render_staff_and_expenses()
-    elif page == "Reports":
+    elif page == "التقارير":
         render_reports()
 
 # --- Login Page Function ---
 def show_login_page():
     """Renders the login form."""
-    st.title("☕ Cafe Manager Login")
+    st.title("☕ تسجيل الدخول - مدير المقهى")
     
-    # Get credentials from secrets
     try:
         app_username = st.secrets["APP_USERNAME"]
         app_password = st.secrets["APP_PASSWORD"]
     except KeyError:
-        st.error("Login credentials not found in secrets.toml.")
-        st.info("Please add [APP_USERNAME] and [APP_PASSWORD] to your .streamlit/secrets.toml file.")
+        st.error("لم يتم العثور على بيانات اعتماد تسجيل الدخول في secrets.toml.")
+        st.info("يرجى إضافة [APP_USERNAME] و [APP_PASSWORD] إلى ملف .streamlit/secrets.toml الخاص بك.")
         st.stop()
 
     with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
+        username = st.text_input("اسم المستخدم")
+        password = st.text_input("كلمة المرور", type="password")
+        submitted = st.form_submit_button("تسجيل الدخول")
 
         if submitted:
             if username == app_username and password == app_password:
                 st.session_state.logged_in = True
                 st.rerun()
             else:
-                st.error("Invalid username or password")
+                st.error("اسم المستخدم أو كلمة المرور غير صحيحة")
 
 # --- Main Control Flow ---
-# Initialize session state for login
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 
-# Check login status and show appropriate page
 if st.session_state.logged_in:
-    main_app() # Run the main application
+    main_app()
 else:
-    show_login_page() # Show the login form
+    show_login_page()
 
