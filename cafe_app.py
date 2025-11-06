@@ -76,9 +76,8 @@ def get_monthly_salary_cost(selected_month_date: date):
         workers = db.table('workers').select('id').execute().data
         days_in_month = calendar.monthrange(selected_month_date.year, selected_month_date.month)[1]
         
-        # Cache for each worker's salary to avoid DB calls in loop
-        worker_salary_cache = {}
-
+        # --- FIX: Removed the faulty internal cache ---
+        # Loop through each day of the month and get the *actual* salary cost for that day.
         for day in range(1, days_in_month + 1):
             current_date_for_loop = selected_month_date.replace(day=day)
             total_salary_for_this_day = 0
@@ -86,25 +85,16 @@ def get_monthly_salary_cost(selected_month_date: date):
             for worker in workers:
                 worker_id = worker['id']
                 
-                # Check cache first
-                if worker_id not in worker_salary_cache or worker_salary_cache[worker_id]['start_date'] > current_date_for_loop:
-                    # Cache is invalid or empty, fetch from DB
-                    salary_entry = db.table('salary_history').select('daily_salary, start_date').eq('worker_id', worker_id).lte('start_date', current_date_for_loop.isoformat()).order('start_date', desc=True).limit(1).execute().data
-                    if salary_entry:
-                        worker_salary_cache[worker_id] = {
-                            'salary': salary_entry[0]['daily_salary'],
-                            'start_date': datetime.fromisoformat(salary_entry[0]['start_date']).date()
-                        }
-                    else:
-                         worker_salary_cache[worker_id] = {'salary': 0, 'start_date': date(1900,1,1)} # No salary found
+                # Get the most recent salary valid for *this specific day*
+                salary_entry = db.table('salary_history').select('daily_salary').eq('worker_id', worker_id).lte('start_date', current_date_for_loop.isoformat()).order('start_date', desc=True).limit(1).execute().data
                 
-                # Use cached salary
-                total_salary_for_this_day += worker_salary_cache[worker_id]['salary']
-                
+                if salary_entry:
+                    total_salary_for_this_day += salary_entry[0]['daily_salary']
+            
+            # Add this day's total salary to the month's total
             total_monthly_salary += total_salary_for_this_day
         
-        # --- FIX: THIS LINE WAS MOVED ---
-        # The return must be *outside* the loop, after all days are summed.
+        # Return the final sum *after* the loop is finished
         return total_monthly_salary
             
     except Exception as e:
@@ -732,7 +722,7 @@ def render_reports():
             - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
             - **إجمالي الربح:** `{gross_profit:,.2f}`
             ---
-            - **رواتب اليوم:** `({total_salaries_today:.2f})`
+            - **رواتب اليوم:** `({total_salaries_today:,.2f})`
             ---
             - **صافي الربح اليومي:** `{net_profit_today:,.2f}`
             """)
