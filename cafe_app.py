@@ -102,8 +102,11 @@ def get_monthly_salary_cost(selected_month_date: date):
                 total_salary_for_this_day += worker_salary_cache[worker_id]['salary']
                 
             total_monthly_salary += total_salary_for_this_day
-            
+        
+        # --- FIX: THIS LINE WAS MOVED ---
+        # The return must be *outside* the loop, after all days are summed.
         return total_monthly_salary
+            
     except Exception as e:
         st.error(f"خطأ في حساب الرواتب الشهرية: {e}")
         return 0
@@ -729,7 +732,7 @@ def render_reports():
             - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
             - **إجمالي الربح:** `{gross_profit:,.2f}`
             ---
-            - **رواتب اليوم:** `({total_salaries_today:,.2f})`
+            - **رواتب اليوم:** `({total_salaries_today:.2f})`
             ---
             - **صافي الربح اليومي:** `{net_profit_today:,.2f}`
             """)
