@@ -224,21 +224,21 @@ def render_monthly_dashboard():
         net_profit = gross_profit - total_costs_operating
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("إجمالي الإيرادات", f"{total_revenue:.2f} $")
-        col2.metric("إجمالي الربح (الإيرادات - التكلفة)", f"{gross_profit:.2f} $")
-        col3.metric("صافي الربح", f"{net_profit:.2f} $", delta_color=("inverse" if net_profit < 0 else "normal"))
+        col1.metric("إجمالي الإيرادات", f"{total_revenue:.3f} $")
+        col2.metric("إجمالي الربح (الإيرادات - التكلفة)", f"{gross_profit:.3f} $")
+        col3.metric("صافي الربح", f"{net_profit:.3f} $", delta_color=("inverse" if net_profit < 0 else "normal"))
 
         with st.expander("عرض تفاصيل الأرباح"):
             st.markdown(f"""
-            - **إجمالي الإيرادات:** `{total_revenue:,.2f}`
-            - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
-            - **إجمالي الربح:** `{gross_profit:,.2f}`
+            - **إجمالي الإيرادات:** `{total_revenue:,.3f}`
+            - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.3f})`
+            - **إجمالي الربح:** `{gross_profit:,.3f}`
             ---
-            - **رواتب الموظفين:** `({total_salaries:,.2f})`
-            - **المصروفات الأخرى:** `({total_expenses:,.2f})`
-            - **إجمالي تكاليف التشغيل:** `({total_costs_operating:,.2f})`
+            - **رواتب الموظفين:** `({total_salaries:,.3f})`
+            - **المصروفات الأخرى:** `({total_expenses:,.3f})`
+            - **إجمالي تكاليف التشغيل:** `({total_costs_operating:,.3f})`
             ---
-            - **صافي الربح:** `{net_profit:,.2f}`
+            - **صافي الربح:** `{net_profit:,.3f}`
             """)
             
     except Exception as e:
@@ -294,7 +294,7 @@ def render_daily_sales():
                 if selected_server and sales_dict and selected_date:
                     total_revenue = process_daily_sales(selected_server['id'], sales_dict, selected_date)
                     if total_revenue > 0:
-                        st.success(f"تم تسجيل المبيعات بنجاح لـ {selected_server['name']} في {selected_date}. إجمالي الإيرادات: ${total_revenue:.2f}")
+                        st.success(f"تم تسجيل المبيعات بنجاح لـ {selected_server['name']} في {selected_date}. إجمالي الإيرادات: ${total_revenue:.3f}")
                         st.info("تم تحديث المخزون.")
                     else:
                         st.error("حدث خطأ أثناء معالجة المبيعات.")
@@ -333,7 +333,7 @@ def render_stock_management():
                 cost_entry = db.table('stock_cost_history').select('cost_per_unit').eq('stock_item_id', item['id']).order('start_date', desc=True).limit(1).execute().data
                 current_cost = cost_entry[0]['cost_per_unit'] if cost_entry else 0
 
-                label = f":{color}[{item['name']}] (الحالي: {item['current_quantity']} {item['unit_of_measure']}) | (التكلفة: ${current_cost:.4f})"
+                label = f":{color}[{item['name']}] (الحالي: {item['current_quantity']} {item['unit_of_measure']}) | (التكلفة: ${current_cost:.3f})"
                 
                 with st.expander(label):
                     st.write(f"**نوع التتبع:** {item['tracking_type']}")
@@ -341,7 +341,7 @@ def render_stock_management():
                     
                     st.subheader("تغيير تكلفة الوحدة")
                     st.info("سيتم تطبيق التكلفة الجديدة على جميع المبيعات والهدر من اليوم فصاعداً.")
-                    new_cost = st.number_input("التكلفة الجديدة للوحدة", min_value=0.0, format="%.4f", key=f"cost_{item['id']}", value=float(current_cost))
+                    new_cost = st.number_input("التكلفة الجديدة للوحدة", min_value=0.0, format="%.3f", step=0.001, key=f"cost_{item['id']}", value=float(current_cost))
                     if st.button("تحديث التكلفة", key=f"upd_cost_{item['id']}"):
                         try:
                             db.table('stock_cost_history').insert({
@@ -349,7 +349,7 @@ def render_stock_management():
                                 'cost_per_unit': new_cost,
                                 'start_date': date.today().isoformat()
                             }).execute()
-                            st.success(f"تم تحديث تكلفة {item['name']} إلى ${new_cost:.4f} بدءاً من اليوم.")
+                            st.success(f"تم تحديث تكلفة {item['name']} إلى ${new_cost:.3f} بدءاً من اليوم.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"خطأ في تحديث التكلفة: {e}")
@@ -373,9 +373,9 @@ def render_stock_management():
         with st.form("new_stock_item_form"):
             name = st.text_input("اسم الصنف (مثل 'حبوب البن'، 'علبة كوكا كولا'، 'مناديل')")
             tracking_type = st.selectbox("نوع التتبع", options=['UNIT', 'MULTI-USE', 'MANUAL'], help="...")
-            current_quantity = st.number_input("الكمية الأولية", min_value=0.0, step=1.0)
+            current_quantity = st.number_input("الكمية الأولية", min_value=0.0, step=0.001)
             unit_of_measure = st.text_input("وحدة القياس (مثل 'g'، 'ml'، 'pcs'، 'pack')")
-            cost_per_unit = st.number_input("التكلفة الأولية للوحدة (تكلفتك)", min_value=0.0, format="%.4f")
+            cost_per_unit = st.number_input("التكلفة الأولية للوحدة (تكلفتك)", min_value=0.0, format="%.3f", step=0.001)
             
             submitted = st.form_submit_button("إضافة الصنف")
             if submitted:
@@ -419,7 +419,7 @@ def render_stock_management():
         
         if item_to_restock:
             if item_to_restock['tracking_type'] in ['UNIT', 'MULTI-USE']:
-                amount_to_add = st.number_input("الكمية المضافة", min_value=0.0, step=1.0)
+                amount_to_add = st.number_input("الكمية المضافة", min_value=0.0, step=0.001)
                 if st.button("إضافة إلى المخزون"):
                     new_quantity = item_to_restock['current_quantity'] + amount_to_add
                     try:
@@ -447,7 +447,7 @@ def render_menu_management():
         st.header("إضافة صنف جديد للقائمة")
         with st.form("new_menu_item_form"):
             name = st.text_input("اسم صنف القائمة (مثل 'لاتيه')")
-            sale_price = st.number_input("سعر البيع الأولي ($)", min_value=0.0, step=0.01)
+            sale_price = st.number_input("سعر البيع الأولي ($)", min_value=0.0, step=0.001, format="%.3f")
             submitted = st.form_submit_button("إضافة صنف للقائمة")
             
             if submitted and name and sale_price > 0:
@@ -483,7 +483,7 @@ def render_menu_management():
                     with st.expander(f"{item['name']} - (السعر الحالي: ${current_price})"):
                         st.subheader("تغيير سعر البيع")
                         st.info("سيتم تطبيق السعر الجديد على جميع المبيعات من اليوم فصاعداً.")
-                        new_price = st.number_input("السعر الجديد ($)", min_value=0.0, step=0.01, key=f"price_{item['id']}", value=float(current_price))
+                        new_price = st.number_input("السعر الجديد ($)", min_value=0.0, step=0.001, format="%.3f", key=f"price_{item['id']}", value=float(current_price))
                         if st.button("تحديث السعر", key=f"upd_price_{item['id']}"):
                             try:
                                 db.table('menu_price_history').insert({
@@ -530,7 +530,7 @@ def render_menu_management():
             stock_item = st.selectbox("اختر مكون المخزون", stock_data, format_func=lambda x: f"{x['name']} ({x['unit_of_measure']})", key="recipe_stock_item")
         with col3:
             unit = next((item['unit_of_measure'] for item in stock_data if item['id'] == stock_item['id']), 'units')
-            quantity_used = st.number_input(f"الكمية المستخدمة ({unit})", min_value=0.0, step=0.1, key="recipe_qty")
+            quantity_used = st.number_input(f"الكمية المستخدمة ({unit})", min_value=0.0, step=0.001, key="recipe_qty")
             
         if st.button("إضافة مكون إلى الوصفة", use_container_width=True):
             if menu_item and stock_item and quantity_used > 0:
@@ -575,7 +575,7 @@ def render_staff_and_expenses():
         with st.form("new_worker_form"):
             name = st.text_input("اسم الموظف")
             role = st.selectbox("الوظيفة", ["server", "barista"], format_func=lambda x: "نادل" if x == "server" else "باريستا")
-            salary = st.number_input("الراتب اليومي الأولي ($)", min_value=0.0, step=1.0)
+            salary = st.number_input("الراتب اليومي الأولي ($)", min_value=0.0, step=0.001, format="%.3f")
             submitted = st.form_submit_button("إضافة موظف")
             
             if submitted and name and role and salary >= 0:
@@ -616,7 +616,7 @@ def render_staff_and_expenses():
                         
                         st.subheader("تغيير الراتب")
                         st.info("سيتم تطبيق الراتب الجديد بدءاً من اليوم.")
-                        new_salary = st.number_input("الراتب اليومي الجديد ($)", min_value=0.0, step=1.0, key=f"salary_{worker['id']}", value=float(current_salary))
+                        new_salary = st.number_input("الراتب اليومي الجديد ($)", min_value=0.0, step=0.001, format="%.3f", key=f"salary_{worker['id']}", value=float(current_salary))
                         if st.button("تحديث الراتب", key=f"upd_salary_{worker['id']}"):
                             try:
                                 db.table('salary_history').insert({
@@ -650,7 +650,7 @@ def render_staff_and_expenses():
         with st.form("new_expense_form"):
             month = st.date_input("الشهر", date.today().replace(day=1))
             description = st.text_input("الوصف (مثل 'كهرباء'، 'إيجار')")
-            amount = st.number_input("المبلغ ($)", min_value=0.0, step=1.0)
+            amount = st.number_input("المبلغ ($)", min_value=0.0, step=0.001, format="%.3f")
             submitted = st.form_submit_button("إضافة مصروف")
             
             if submitted and month and description and amount > 0:
@@ -711,20 +711,20 @@ def render_reports():
         net_profit_today = gross_profit - total_salaries_today
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("إجمالي الإيرادات", f"{total_revenue:.2f} $")
-        col2.metric("إجمالي الربح", f"{gross_profit:.2f} $")
-        col3.metric("رواتب اليوم", f"({total_salaries_today:.2f}) $")
-        col4.metric("صافي الربح اليومي", f"{net_profit_today:.2f} $", delta_color=("inverse" if net_profit_today < 0 else "normal"))
+        col1.metric("إجمالي الإيرادات", f"{total_revenue:.3f} $")
+        col2.metric("إجمالي الربح", f"{gross_profit:.3f} $")
+        col3.metric("رواتب اليوم", f"({total_salaries_today:.3f}) $")
+        col4.metric("صافي الربح اليومي", f"{net_profit_today:.3f} $", delta_color=("inverse" if net_profit_today < 0 else "normal"))
 
         with st.expander("عرض تفاصيل تقرير اليوم"):
             st.markdown(f"""
-            - **إجمالي الإيرادات:** `{total_revenue:,.2f}`
-            - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
-            - **إجمالي الربح:** `{gross_profit:,.2f}`
+            - **إجمالي الإيرادات:** `{total_revenue:,.3f}`
+            - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.3f})`
+            - **إجمالي الربح:** `{gross_profit:,.3f}`
             ---
-            - **رواتب اليوم:** `({total_salaries_today:,.2f})`
+            - **رواتب اليوم:** `({total_salaries_today:,.3f})`
             ---
-            - **صافي الربح اليومي:** `{net_profit_today:,.2f}`
+            - **صافي الربح اليومي:** `{net_profit_today:,.3f}`
             """)
 
     if report_type == "شهري":
@@ -759,21 +759,21 @@ def render_reports():
             st.subheader(f"تقرير لشهر {selected_month_date.strftime('%B %Y')}")
             
             col1, col2, col3 = st.columns(3)
-            col1.metric("إجمالي الإيرادات", f"{total_revenue:.2f} $")
-            col2.metric("إجمالي الربح (الإيرادات - التكلفة)", f"{gross_profit:.2f} $")
-            col3.metric("صافي الربح", f"{net_profit:.2f} $", delta_color=("inverse" if net_profit < 0 else "normal"))
+            col1.metric("إجمالي الإيرادات", f"{total_revenue:.3f} $")
+            col2.metric("إجمالي الربح (الإيرادات - التكلفة)", f"{gross_profit:.3f} $")
+            col3.metric("صافي الربح", f"{net_profit:.3f} $", delta_color=("inverse" if net_profit < 0 else "normal"))
 
             with st.expander("عرض تفاصيل الأرباح"):
                 st.markdown(f"""
-                - **إجمالي الإيرادات:** `{total_revenue:,.2f}`
-                - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.2f})`
-                - **إجمالي الربح:** `{gross_profit:,.2f}`
+                - **إجمالي الإيرادات:** `{total_revenue:,.3f}`
+                - **إجمالي تكلفة البضائع (COGS):** `({total_cogs:,.3f})`
+                - **إجمالي الربح:** `{gross_profit:,.3f}`
                 ---
-                - **رواتب الموظفين:** `({total_salaries:,.2f})`
-                - **المصروفات الأخرى:** `({total_expenses:,.2f})`
-                - **إجمالي تكاليف التشغيل:** `({total_costs_operating:,.2f})`
+                - **رواتب الموظفين:** `({total_salaries:,.3f})`
+                - **المصروفات الأخرى:** `({total_expenses:,.3f})`
+                - **إجمالي تكاليف التشغيل:** `({total_costs_operating:,.3f})`
                 ---
-                - **صافي الربح:** `{net_profit:,.2f}`
+                - **صافي الربح:** `{net_profit:,.3f}`
                 """)
                 
         except Exception as e:
@@ -815,15 +815,15 @@ def render_manage_orders():
                             item_data.append({
                                 "الصنف": item_name,
                                 "الكمية": item['quantity'],
-                                "سعر الوحدة": f"${item['price_at_sale']:.2f}",
-                                "إجمالي الإيرادات": f"${revenue:.2f}",
-                                "إجمالي التكلفة": f"${cost:.2f}"
+                                "سعر الوحدة": f"${item['price_at_sale']:.3f}",
+                                "إجمالي الإيرادات": f"${revenue:.3f}",
+                                "إجمالي التكلفة": f"${cost:.3f}"
                             })
                             total_revenue += revenue
                             total_cost += cost
                     
                     st.dataframe(pd.DataFrame(item_data), hide_index=True, use_container_width=True)
-                    st.markdown(f"**إجمالي الإيرادات:** `${total_revenue:.2f}` | **إجمالي التكلفة:** `${total_cost:.2f}`")
+                    st.markdown(f"**إجمالي الإيرادات:** `${total_revenue:.3f}` | **إجمالي التكلفة:** `${total_cost:.3f}`")
 
                 else:
                     st.write("هذا الطلب لا يحتوي على أصناف.")
@@ -906,7 +906,7 @@ def render_wastage():
                         'amount': total_cost_of_wastage
                     }).execute()
                     
-                    st.success(f"تم تسجيل الهدر بنجاح. التكلفة الإجمالية: ${total_cost_of_wastage:.2f}")
+                    st.success(f"تم تسجيل الهدر بنجاح. التكلفة الإجمالية: ${total_cost_of_wastage:.3f}")
                     st.info("تم تحديث المخزون وإضافة التكلفة إلى المصروفات.")
                 
                 except Exception as e:
